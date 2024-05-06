@@ -1,12 +1,21 @@
 #!/usr/bin/env python3
 
+# EMS - Energy Management System for home automation and monitoring
+# Author  : Romuald Dufour
+# License : GPL v3
+# Release : 2024.05
+
+# 2024.04 - Add PVOuput publishing, add logger
+# 2024.05 - Add config from toml file, add more comments, some code refactoring
+
 # general imports
 import sys
 import logging
 import threading
 import time
+from datetime import datetime
 
-# Logging
+# Initiate logger
 logger = logging.getLogger("EMS")
 logger.setLevel(logging.INFO)
 
@@ -21,48 +30,52 @@ stdout.setFormatter(fmt)
 logger.addHandler(stdout)
 
 
-# Read configurations
+# Read configurations from TOML file in current dir and set global vars
 import tomllib
-
 try:
   with open("ems.toml", "rb") as f:
     cfg = tomllib.load(f)
     logger.info('CFG  - Config file parsed')
+    grid_maxcurrent = cfg['grid']['maxcurrent']
+    if ((grid_maxcurrent) < 6): grid_maxcurrent = 6
+    grid_loadbalancing = grid_maxcurrent
 except:
   logger.error("CFG  - Config file error")
   quit()
 
 
-# imports
+# imports for data manipulation
 import pandas as pd
 import copy
 import json
-from datetime import datetime
-from pvoutput import PVOutput
 
-# imports for P1 socket
+# imports for dataclasses
+from dataclasses import dataclass, field
+
+# imports for DSMR - P1 socket
 import socket
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 
-# imports for modbus
+# imports for DSMR - DSMR parser (OBIS)
+from dsmr_parser import telegram_specifications
+from dsmr_parser.clients import SocketReader
+
+# imports for EVSE - modbus
 from pymodbus.constants import Endian
 from pymodbus.payload import BinaryPayloadDecoder
 from pymodbus.payload import BinaryPayloadBuilder
 from pymodbus.client import ModbusTcpClient
 
-# imports for DSMR/P1
-from dsmr_parser import telegram_specifications
-from dsmr_parser.clients import SocketReader
-
 # imports for MQTT
 import paho.mqtt.client as paho
 
-# imports for dataclasses
-from dataclasses import dataclass, field
+# imports for PVO
+from pvoutput import PVOutput
 
 
 
-# Threats data
+# Threats data definition
+# Thread can have data class, an access lock and dataframe
 evse_lock = threading.Lock()
 evse_hb = 0
 @dataclass
@@ -78,6 +91,7 @@ class evse_class:
         I_Max_Activated: int=0
         I_Max_Safe: int=0
         I_Max_Validtime: int=0
+        I_LB_Limit: int=grid_maxcurrent
         Phases_Requested: int=1
         Send_Timeout: int=0
         Send_I_Max: int=0
@@ -222,13 +236,18 @@ ctrl_hb = 0
 class ctrl_class:
         evse_set_I_max: int=-1
         evse_set_Phases: int=-1
+        evse_loadbalancing_limit: int=-1
 ctrl = ctrl_class()
 
 pvo_lock = threading.Lock()
 pvo_hb = 0
 
 
-# EVSE Processes
+# EVSE thread
+#  Target : Alfen Pro Line EV charging station with EMS mode activated
+#  - Maintain modbus connectivity to the charging station
+#  - Get voltage, current, power, energy meter and misc. data every second
+#  - Write current limit and phases count
 def evse_process():
   evse_connected = False
   while (True):
@@ -273,26 +292,27 @@ def evse_process():
 
             with ctrl_lock:
               if ((ctrl.evse_set_I_max >=0) and (ctrl.evse_set_I_max <= 32)):
-                  evse.Send_I_Max = ctrl.evse_set_I_max
-                  ctrl.evse_set_I_max = -1
-                  evse.Send_Timeout = 1
+                 evse.Send_I_Max = ctrl.evse_set_I_max
+                 if (evse.Send_I_Max > grid_maxcurrent): evse.Send_I_Max = grid_maxcurrent
+                 ctrl.evse_set_I_max = -1
+                 evse.Send_Timeout = 1
               if ((ctrl.evse_set_Phases ==1) or (ctrl.evse_set_Phases == 3)):
-                  evse.Send_Phases = ctrl.evse_set_Phases
-                  ctrl.evse_set_Phases = -1
-                  evse.Send_Timeout = 1
-                  
+                 evse.Send_Phases = ctrl.evse_set_Phases
+                 ctrl.evse_set_Phases = -1
+                 evse.Send_Timeout = 1
+              if (ctrl.evse_loadbalancing_limit != evse.I_LB_Limit):
+                 evse.I_LB_Limit = ctrl.evse_loadbalancing_limit
+                 evse.Send_Timeout = 1
+                
+
             if (evse.Send_Timeout <= 0):
               evse.Send_Timeout = 60
               # write IMax
               if (evse.Send_I_Max >=0) and (evse.Send_I_Max<=32):
 
                 Send_I_Max = evse.Send_I_Max
-
-                #if (evse.Send_I_Max >= 6): evse.Send_Phases = 3
-                #if ((evse.Send_I_Max >=1) and (evse.Send_I_Max < 6)):
-                #  evse.Send_Phases = 1
-                #  Send_I_Max = evse.Send_I_Max * 2 + 4 
-                  
+                if ((evse.I_LB_Limit >= 0) and (Send_I_Max > evse.I_LB_Limit)): Send_I_Max = evse.I_LB_Limit
+               
                 logger.info("EVSE - Writing - I_Max:%i A" % Send_I_Max)
                 builder = BinaryPayloadBuilder(byteorder=Endian.BIG, wordorder=Endian.BIG)
                 builder.add_32bit_float(1.0 * Send_I_Max)
@@ -305,7 +325,6 @@ def evse_process():
                   builder.add_16bit_uint(evse.Send_Phases)
                   payload = builder.build()
                   result  = client.write_registers(1215, payload, skip_encode=True, slave=1)
-
 
             evse.Send_Timeout = evse.Send_Timeout-1
 
@@ -326,7 +345,11 @@ def evse_process():
   time.sleep(5)
 
 
-# DSMR P1 processes
+# DSMR thread
+#  Target : Belgium digital smartmeter with P1 port enabled and serial to socket adapter (ESP8266)
+#  - Maintain connection to ESP socket
+#  - receive P1 telegram every second
+#  - parse telegram and save data
 def dsmr_process():
   from datetime import datetime
   from pytz import timezone
@@ -383,11 +406,16 @@ def dsmr_process():
             for month in range(13):
               data = json.loads(telegram.BELGIUM_MAXIMUM_DEMAND_13_MONTHS[month].to_json())
               #print(data, data['value'])
+              # TODO - Parse 13 month QH Max demand
           except:
             pass
 
 
-# Kostal Inverter processes
+# Inverter thread
+#  Target : Kostal Solar inverter
+#  - Maintain connection to inverter
+#  - Get data every second
+#  - Save data
 def CnvStatusTxt(Val):
     Txt = "Communication error"
     if Val == 0: Txt = "Off"
@@ -486,8 +514,6 @@ def piko_process():
       C="C" if Val & 0x02 else "-"
       E="E" if Val & 0x100 else "-"
       return E+I+C+L
-
-
 
 
   while(True):
@@ -646,7 +672,10 @@ def piko_process():
   s.close()
 
 
-# mqtt process
+# MQTT thread
+#  Taget : MQTT server (e.g. Mosquitto)
+#  - publish all received data on regular basis (about every 15 seconds)
+#  - subscribe to control topics (to control EVSE)
 def mqtt_process():
   global mqtt_last_sent
   if (cfg['mqtt']['api_v1']):
@@ -655,7 +684,6 @@ def mqtt_process():
     mqttc = paho.Client(cfg['mqtt']['name'])
 
   MQTTTopic="ems/"
-  mqtt_connected = False
 
   def mqtt_on_connect(client, obj, flags, rc):
     logger.info("MQTT - Connected")
@@ -665,12 +693,12 @@ def mqtt_process():
     topic = message.topic  #.split("evse/", 1)[1]
     data = message.payload.decode("utf-8")
     #logger.info("MQTT - Received %s:%s" % (topic, data))
-    if (topic == "ems/evse/ctrl/maxpwr"):
-       val = int(float(data)) 
-       if (val >= 0) and (val <= 22):
-          with ctrl_lock:
-            ctrl.evse_set_I_max = val 
-            logger.info("MQTT - Received EVSE MaxPwr %d", ctrl.evse_set_I_max)
+    #if (topic == "ems/evse/ctrl/maxpwr"):
+    #   val = int(float(data)) 
+    #   if (val >= 0) and (val <= 22):
+    #      with ctrl_lock:
+    #        ctrl.evse_set_I_max = val 
+    #        logger.info("MQTT - Received EVSE MaxPwr %d", ctrl.evse_set_I_max)
     if (topic == "ems/evse/ctrl/maxcurrent"):
        val = int(float(data)) 
        if (val >= 0) and (val <= 32):
@@ -684,6 +712,7 @@ def mqtt_process():
             ctrl.evse_set_Phases = val 
             logger.info("MQTT - Received EVSE Phases %d", ctrl.evse_set_Phases)
 
+  mqtt_connected = False
   while (True):
 
     if (mqtt_connected == False):
@@ -695,13 +724,18 @@ def mqtt_process():
         mqttc.connect(cfg['mqtt']['host'], cfg['mqtt']['port'], 5)
         mqttc.loop_start()
         mqtt_connected = True
+        time.sleep(1)
       except Exception as error:
         print("MQTT - An exception occurred:", type(error).__name__, "–", error)
         logger.error("MQTT - Exception - broker connection error")
         mqtt_connected = False
         pass
 
-      while (mqtt_connected and mqttc.is_connected()):
+    if (mqtt_connected and (mqttc.is_connected() == False)):
+       logger.error("MQTT - Disconnected")
+       mqtt_connected = False
+    
+    if (mqtt_connected and mqttc.is_connected()):
         with mqtt_lock:
           if (mqtt.Valid):
             force = ((datetime.now().second == 0) and (datetime.now().minute % 15 == 0))
@@ -798,7 +832,9 @@ def mqtt_process():
   logger.error("MQTT - broker connection error")
   time.sleep(1)
 
-# pvo process
+# PVO threat
+#  Target : PVOutput portal
+#  - publish inverter data to PVO every 5 minutes
 def pvo_process():
    
   while(True):
@@ -824,7 +860,6 @@ def pvo_process():
             }
             #"v4": 450,  # power consumption
             #  "v5": 23.5,  # temperature
-            #  "v6": 234.0,  # voltage
             #  "m1": "Testing",  # custom message
             #}
             pvo_status = pvo.addstatus(data).text
@@ -837,13 +872,11 @@ def pvo_process():
 
     time.sleep(1)
 
+
 # Main
 if __name__ == "__main__":
 
-#  format = "%(asctime)s: %(message)s"
-#  logging.basicConfig(format=format, level=logging.INFO,
-#                                     datefmt="%H:%M:%S")
-
+  # Starting all threads
   logger.info("Main - starting threads")
 
   dsmr_threat = threading.Thread(target=dsmr_process, args=(), daemon=True)
@@ -861,17 +894,20 @@ if __name__ == "__main__":
   pvo_threat = threading.Thread(target=pvo_process, args=(), daemon=True)
   pvo_threat.start()
 
-  logger.info("Main - Main loop")
-
+  # Init data
   index: int = 0
   dsmr_index: int = 0
   evse_index: int = 0
   piko_index: int = 0
   
+  lb_index: int = 0
+
+  # Starting main loop
+  logger.info("Main - Main loop")
   while (True):
     index = index + 1
 
-    # get threat data
+    # get threat data, push to dataframe to keep last 60 seconds of data
     with dsmr_lock:
       if (dsmr.Valid == True):
           new_row = {'U1': dsmr.U[0], 'U2': dsmr.U[1], 'U3': dsmr.U[2],
@@ -920,21 +956,25 @@ if __name__ == "__main__":
           piko_hb = 0
           piko.Valid = False
 
+    # check heartbeat from all threads
     sec = datetime.now().second
 
     if (dsmr_hb > 60):
       if ((sec % 15)==0): logger.warning("DSMR - Communication lost")
     dsmr_hb = dsmr_hb + 1
+
     if (evse_hb > 60):
       if ((sec % 15)==0):
         logger.warning("EVSE - Communication lost")
         #evse_threat.kill()
         #evse_threat.start()
     evse_hb = evse_hb + 1
+
     if (piko_hb > 60):
       if ((sec % 15)==0): logger.warning("PIKO - Communication lost")
     piko_hb = piko_hb + 1
 
+    # Calculate mobile average for 5, 15 and 60 seconds of data
     if ((sec % 5)==0):
       dsmr_mean_5s = dsmr_df.iloc[-5:].mean(numeric_only=True).fillna(0)
       evse_mean_5s = evse_df.iloc[-5:].mean(numeric_only=True).fillna(0)
@@ -953,9 +993,9 @@ if __name__ == "__main__":
       piko_mean_60s = piko_df.iloc[-60:].mean(numeric_only=True).fillna(0)
 
 
-
-
+    # Every 5 seconds (after at least 15 records in the dataframes)
     if ((index >= 15) and ((sec % 5)==0)):
+      # - print data on the logger
       logger.info("DSMR - P_Cons:%5i P_Inj:%5i E_Cons:%10i E_Inj:%10i U:(%5.1f %5.1f %5.1f) I:(%5.2f %5.2f %5.2f) QH:(%5i %5i %5i)" %
                   (dsmr_mean_5s.P_Cons, dsmr_mean_5s.P_Inj, dsmr_main.E_Tot_Cons, dsmr_main.E_Tot_Inj,
                    dsmr_mean_5s.U1, dsmr_mean_5s.U2, dsmr_mean_5s.U3, dsmr_mean_5s.I1, dsmr_mean_5s.I2, dsmr_mean_5s.I3,
@@ -965,6 +1005,34 @@ if __name__ == "__main__":
       logger.info("PIKO - Pwr:%5i E_Day:%5i E_Tot:%10i Status:%s" % (piko_mean_5s.P_Inj, piko_main.E_Day, piko_main.E_Tot, CnvStatusTxt(piko_main.Status)))
       logger.info("HOUSE- Pwr:%5i" % house_P)
 
+      # - do loadbalancing algo to limit evse current if needed
+      lb_index = lb_index + 1
+      grid_maxphasecurrent = max([dsmr_mean_5s.I1, dsmr_mean_5s.I2, dsmr_mean_5s.I3])
+      evse_current = max([evse_mean_5s.I1, evse_mean_5s.I2, evse_mean_5s.I3])
+      if (grid_maxphasecurrent > grid_maxcurrent):
+        grid_loadbalancing = evse_current - (grid_maxphasecurrent - grid_maxcurrent) - 1.5
+        if (grid_loadbalancing < 6): grid_loadbalancing = 0
+        ctrl.evse_loadbalancing_limit = grid_loadbalancing
+        lb_index = 0
+      else:
+        if (grid_loadbalancing < grid_maxcurrent):
+          if ((grid_loadbalancing >= 6) and (lb_index >= 3)):
+            if (grid_maxphasecurrent < grid_maxcurrent - 2.5):
+              grid_loadbalancing = grid_loadbalancing + 1
+              if (grid_maxphasecurrent < grid_maxcurrent - 4):
+                grid_loadbalancing = grid_loadbalancing + 1
+              if (grid_maxphasecurrent < grid_maxcurrent - 8):
+                grid_loadbalancing = grid_loadbalancing + 3
+              ctrl.evse_loadbalancing_limit = grid_loadbalancing
+              lb_index = 0
+          if ((grid_loadbalancing < 6) and (lb_index >= 4)):
+            if (grid_maxphasecurrent < grid_maxcurrent - 8):
+               grid_loadbalancing = 6
+               ctrl.evse_loadbalancing_limit = grid_loadbalancing
+               lb_index = -3
+
+         
+      # - send to MQTT for publishing
       with (mqtt_lock):
         mqtt.Meter_U = [dsmr_mean_5s.U1, dsmr_mean_5s.U2, dsmr_mean_5s.U3] 
         mqtt.Meter_I = [dsmr_mean_5s.I1, dsmr_mean_5s.I2, dsmr_mean_5s.I3] 
