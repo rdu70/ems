@@ -10,6 +10,8 @@
 #           Add solar tracking for EVSE
 #           Add Piko temperature control
 
+RELEASE = '2024.05.23'
+
 # general imports
 import sys
 import logging
@@ -30,7 +32,7 @@ stdout = logging.StreamHandler(stream=sys.stdout)
 stdout.setLevel(logging.INFO)
 stdout.setFormatter(fmt)
 logger.addHandler(stdout)
-
+logger.info("Main - Release %s" % RELEASE)
 
 # Read configurations from TOML file in current dir and set global vars
 import tomllib
@@ -549,7 +551,7 @@ def piko_process():
   def CnvTemp(Val):
       T=(int("0x"+TRef, 16)-Val)/448.0+22
       if T<0.0: T=0.0
-      if T>99.99: T=99.99
+      if T>99.99: T=0.0
       return T
 
   def CnvCA_S(Val):
@@ -640,6 +642,7 @@ def piko_process():
               Error = Recv[6];
               ErrorCode = GetWord(Recv, 7)
             if (Status > 5): Status = -1
+            StatusTxt = CnvStatusTxt(Status)
 
           if ((Count % 60) == 0):   # every minute
             # Get Total Wh
@@ -1059,7 +1062,7 @@ if __name__ == "__main__":
       dsmr_mean_5s = dsmr_df.iloc[-5:].mean(numeric_only=True).fillna(0)
       evse_mean_5s = evse_df.iloc[-5:].mean(numeric_only=True).fillna(0)
       piko_mean_5s = piko_df.iloc[-5:].mean(numeric_only=True).fillna(0)
-      if (index >= 15):
+      if (index > 15):
          house_P = dsmr_mean_15s.P - evse_mean_15s.P_Delivered + piko_mean_15s.P_Inj
          if (house_P < 0): house_P = 0
 
