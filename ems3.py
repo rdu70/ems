@@ -7,6 +7,8 @@
 
 # 2024.04 - Add PVOuput publishing, add logger
 # 2024.05 - Add config from toml file, add more comments, some code refactoring
+#           Add solar tracking for EVSE
+#           Add Piko temperature control
 
 # general imports
 import sys
@@ -44,35 +46,40 @@ except:
   quit()
 
 
-# imports for data manipulation
+# import libs for data manipulation
 import pandas as pd
 import copy
 import json
 
-# imports for dataclasses
+# import libs for dataclasses
 from dataclasses import dataclass, field
 
-# imports for DSMR - P1 socket
+# import libs for DSMR - P1 socket
 import socket
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 
-# imports for DSMR - DSMR parser (OBIS)
+# import libs for DSMR - DSMR parser (OBIS)
 from dsmr_parser import telegram_specifications
 from dsmr_parser.clients import SocketReader
 
-# imports for EVSE - modbus
+# import libs for EVSE - modbus
 from pymodbus.constants import Endian
 from pymodbus.payload import BinaryPayloadDecoder
 from pymodbus.payload import BinaryPayloadBuilder
 from pymodbus.client import ModbusTcpClient
 
-# imports for MQTT
+# import libs for MQTT
 import paho.mqtt.client as paho
 
-# imports for PVO
+# import libs for PVO
 from pvoutput import PVOutput
 
-
+# define some constants
+EVSE_MODE_OFF = 0
+EVSE_MODE_MANUAL = 1
+EVSE_MODE_SOLAR_MIN = 2
+EVSE_MODE_SOLAR_MEAN = 3
+EVSE_MODE_SOLAR_MAX = 4
 
 # Threats data definition
 # Thread can have data class, an access lock and dataframe
@@ -163,6 +170,8 @@ class piko_class:
         U_DC: list[float] = field(default_factory=list)
         I_DC: list[float] = field(default_factory=list)
         P_DC: list[float] = field(default_factory=list)
+        T_DC: int=0
+        T_AC: int=0
         Time_Run: int=0
         Time_Inst: int=0
         Status: int=0
@@ -180,7 +189,9 @@ piko_df = pd.DataFrame({'U1': pd.Series(dtype='float'),
                      'U1_DC': pd.Series(dtype='float'),
                      'U2_DC': pd.Series(dtype='float'),
                      'I1_DC': pd.Series(dtype='float'),
-                     'I2_DC': pd.Series(dtype='float')
+                     'I2_DC': pd.Series(dtype='float'),
+                     'T_DC': pd.Series(dtype='float'),
+                     'T_AC': pd.Series(dtype='float')
                     })
 
 house_P: int = 0
@@ -213,6 +224,8 @@ class mqtt_class:
         Inv_U_DC: list[float] = field(default_factory=list)
         Inv_I_DC: list[float] = field(default_factory=list)
         Inv_P_DC: list[float] = field(default_factory=list)
+        Inv_T_DC: int=0
+        Inv_T_AC: int=0
         Inv_Time_Run: int=0
         Inv_Time_Inst: int=0
         Inv_Status: int=0
@@ -234,9 +247,16 @@ ctrl_lock = threading.Lock()
 ctrl_hb = 0
 @dataclass
 class ctrl_class:
-        evse_set_I_max: int=-1
-        evse_set_Phases: int=-1
-        evse_loadbalancing_limit: int=-1
+        evse_set_I_max: int = -1
+        evse_set_Phases: int = -1
+        evse_loadbalancing_limit: int = -1
+        evse_mode: int = EVSE_MODE_OFF
+        evse_mode_changed: bool = True
+        evse_solar_target: int = -1
+        evse_solar_margin_min: int = -1
+        evse_solar_margin_mean: int = -1
+        evse_solar_margin_max: int = -1
+        evse_solar_margin_updated: bool = False
 ctrl = ctrl_class()
 
 pvo_lock = threading.Lock()
@@ -303,28 +323,57 @@ def evse_process():
               if (ctrl.evse_loadbalancing_limit != evse.I_LB_Limit):
                  evse.I_LB_Limit = ctrl.evse_loadbalancing_limit
                  evse.Send_Timeout = 1
+
+              if (ctrl.evse_mode_changed):
+                 ctrl.evse_mode_changed = False
+                 evse.Send_Timeout = 1
+              if (ctrl.evse_solar_margin_updated):
+                 ctrl.evse_solar_margin_updated = False
+                 evse.Send_Timeout = 1
+
+              if (evse.Send_Timeout <= 0):
+                evse.Send_Timeout = 60
+                # write IMax
+                if (evse.Send_I_Max >=0) and (evse.Send_I_Max<=32):
+
+                  amp_ratio = 230 * max(evse.Phases_Requested, 1)
+                  ctrl.evse_solar_target = round(ctrl.evse_solar_margin_mean / amp_ratio)
+
+                  if (ctrl.evse_mode == EVSE_MODE_SOLAR_MIN): ctrl.evse_solar_target = ctrl.evse_solar_margin_min / amp_ratio
+                  if (ctrl.evse_mode == EVSE_MODE_SOLAR_MAX): ctrl.evse_solar_target = ctrl.evse_solar_margin_max / amp_ratio
+                  if (ctrl.evse_solar_target > 0) and (ctrl.evse_solar_target <= 3): ctrl.evse_solar_target = 0
+                  if (ctrl.evse_solar_target > 3) and (ctrl.evse_solar_target <= 3): ctrl.evse_solar_target = 0
+
+                  if (evse.Phases_Requested == 3):
+                    solar_I_start = cfg['evse']['solar_start_3ph']
+                    solar_I_min = cfg['evse']['solar_min_3ph']
+                    solar_I_max = cfg['evse']['solar_max_3ph']
+                  else:
+                    solar_I_start = cfg['evse']['solar_start_1ph']
+                    solar_I_min = cfg['evse']['solar_min_1ph']
+                    solar_I_max = cfg['evse']['solar_max_1ph']
+
+                  if (ctrl.evse_solar_target > solar_I_max): ctrl.evse_solar_target = solar_I_max
+                  if (ctrl.evse_solar_target < solar_I_start): ctrl.evse_solar_target = 0
+                  if ((ctrl.evse_solar_target > 0) and (ctrl.evse_solar_target < solar_I_min)): ctrl.evse_solar_target = solar_I_min
+
+                  if (ctrl.evse_mode == EVSE_MODE_OFF): Send_I_Max = 0
+                  if (ctrl.evse_mode == EVSE_MODE_MANUAL): Send_I_Max = evse.Send_I_Max
+                  if (ctrl.evse_mode >= EVSE_MODE_SOLAR_MIN): Send_I_Max = max(ctrl.evse_solar_target, evse.Send_I_Max)
+                  if ((evse.I_LB_Limit >= 0) and (Send_I_Max > evse.I_LB_Limit)): Send_I_Max = evse.I_LB_Limit
                 
-
-            if (evse.Send_Timeout <= 0):
-              evse.Send_Timeout = 60
-              # write IMax
-              if (evse.Send_I_Max >=0) and (evse.Send_I_Max<=32):
-
-                Send_I_Max = evse.Send_I_Max
-                if ((evse.I_LB_Limit >= 0) and (Send_I_Max > evse.I_LB_Limit)): Send_I_Max = evse.I_LB_Limit
-               
-                logger.info("EVSE - Writing - I_Max:%i A" % Send_I_Max)
-                builder = BinaryPayloadBuilder(byteorder=Endian.BIG, wordorder=Endian.BIG)
-                builder.add_32bit_float(1.0 * Send_I_Max)
-                payload = builder.build()
-                result  = client.write_registers(1210, payload, skip_encode=True, slave=1)
-
-                if (((evse.Send_Phases == 1) or (evse.Send_Phases == 3)) and (evse.Send_Phases != evse.Phases_Requested)):
-                  logger.info("EVSE - Writing - Phases:%i" % evse.Send_Phases)
+                  logger.info("EVSE - Writing - I_Max:%i A - Mode:%i - Solar Target:%i" % (Send_I_Max, ctrl.evse_mode, ctrl.evse_solar_target))
                   builder = BinaryPayloadBuilder(byteorder=Endian.BIG, wordorder=Endian.BIG)
-                  builder.add_16bit_uint(evse.Send_Phases)
+                  builder.add_32bit_float(1.0 * Send_I_Max)
                   payload = builder.build()
-                  result  = client.write_registers(1215, payload, skip_encode=True, slave=1)
+                  result  = client.write_registers(1210, payload, skip_encode=True, slave=1)
+
+                  if (((evse.Send_Phases == 1) or (evse.Send_Phases == 3)) and (evse.Send_Phases != evse.Phases_Requested)):
+                    logger.info("EVSE - Writing - Phases:%i" % evse.Send_Phases)
+                    builder = BinaryPayloadBuilder(byteorder=Endian.BIG, wordorder=Endian.BIG)
+                    builder.add_16bit_uint(evse.Send_Phases)
+                    payload = builder.build()
+                    result  = client.write_registers(1215, payload, skip_encode=True, slave=1)
 
             evse.Send_Timeout = evse.Send_Timeout-1
 
@@ -567,7 +616,7 @@ def piko_process():
 
         # Calc TRef (Default 0xc800)
         TRef="c800"
-        if InvModel == "PIKO 5.5":
+        if ((InvModel == "PIKO 5.5") or (InvModel == "convert 6T dcs")):
             TRef="8000"
 
         # Get Inverter Name
@@ -646,6 +695,14 @@ def piko_process():
             CA3_P=GetWord(Recv, 55)
             CC_P=CC1_P+CC2_P+CC3_P
             CA_P=CA1_P+CA2_P+CA3_P
+
+            CC1_T=CnvTemp(GetWord(Recv, 11))
+            CC2_T=CnvTemp(GetWord(Recv, 21))
+            CC3_T=CnvTemp(GetWord(Recv, 31))
+            CA1_T=CnvTemp(GetWord(Recv, 41))
+            CA2_T=CnvTemp(GetWord(Recv, 49))
+            CA3_T=CnvTemp(GetWord(Recv, 57))
+
             LiveData = 1
             LiveError = 0
           else:
@@ -664,6 +721,8 @@ def piko_process():
             if (TotalWh>=0): piko.E_Tot = TotalWh
             if (InvRunTime>=0): piko.Time_Run = InvRunTime
             if (InvInstTime>=0): piko.Time_Inst = InvInstTime
+            piko.T_DC = max(CC1_T, CC2_T, CC3_T)
+            piko.T_AC = max(CA1_T, CA2_T, CA3_T)
             piko.Status = Status
             piko.Valid = True
 
@@ -692,13 +751,6 @@ def mqtt_process():
   def mqtt_on_message(client, userdata, message):
     topic = message.topic  #.split("evse/", 1)[1]
     data = message.payload.decode("utf-8")
-    #logger.info("MQTT - Received %s:%s" % (topic, data))
-    #if (topic == "ems/evse/ctrl/maxpwr"):
-    #   val = int(float(data)) 
-    #   if (val >= 0) and (val <= 22):
-    #      with ctrl_lock:
-    #        ctrl.evse_set_I_max = val 
-    #        logger.info("MQTT - Received EVSE MaxPwr %d", ctrl.evse_set_I_max)
     if (topic == "ems/evse/ctrl/maxcurrent"):
        val = int(float(data)) 
        if (val >= 0) and (val <= 32):
@@ -711,6 +763,19 @@ def mqtt_process():
           with ctrl_lock:
             ctrl.evse_set_Phases = val 
             logger.info("MQTT - Received EVSE Phases %d", ctrl.evse_set_Phases)
+    if (topic == "ems/evse/ctrl/mode"):
+       val = data 
+       if (val == "OFF") or (val == "MANUAL") or (val == "SOLAR MIN") or (val == "SOLAR MEAN") or (val == "SOLAR MAX"):
+          with ctrl_lock:
+            old_mode = ctrl.evse_mode
+            if (val == "OFF"): ctrl.evse_mode = EVSE_MODE_OFF
+            if (val == "MANUAL"): ctrl.evse_mode = EVSE_MODE_MANUAL
+            if (val == "SOLAR MIN"): ctrl.evse_mode = EVSE_MODE_SOLAR_MIN
+            if (val == "SOLAR MEAN"): ctrl.evse_mode = EVSE_MODE_SOLAR_MEAN
+            if (val == "SOLAR MAX"): ctrl.evse_mode = EVSE_MODE_SOLAR_MAX
+            if ((old_mode <= EVSE_MODE_MANUAL) and (ctrl.evse_mode >= EVSE_MODE_SOLAR_MIN)): ctrl.evse_solar_target = evse.Send_I_Max
+            ctrl.evse_mode_changed = True
+            logger.info("MQTT - Received EVSE charging mode %s", val)
 
   mqtt_connected = False
   while (True):
@@ -781,6 +846,10 @@ def mqtt_process():
               if ((mqtt.Inv_E_Tot != mqtt_last_sent.Inv_E_Tot) or force):
                 if (mqtt.Inv_E_Tot!=0):
                   mqttc.publish(MQTTTopic+'inverter/E_injected', '%d'%mqtt.Inv_E_Tot, retain=True)
+              if (mqtt.Inv_T_DC != mqtt_last_sent.Inv_T_DC) or force:
+                mqttc.publish(MQTTTopic+'inverter/Temp_DC', '%0.1f'%mqtt.Inv_T_DC)
+              if (mqtt.Inv_T_AC != mqtt_last_sent.Inv_T_AC) or force:
+                mqttc.publish(MQTTTopic+'inverter/Temp_AC', '%0.1f'%mqtt.Inv_T_AC)
               
               if (mqtt.Inv_Status != mqtt_last_sent.Inv_Status) or force:
                 mqttc.publish(MQTTTopic+'inverter/Status', CnvStatusTxt(mqtt.Inv_Status), retain=True)
@@ -879,20 +948,25 @@ if __name__ == "__main__":
   # Starting all threads
   logger.info("Main - starting threads")
 
-  dsmr_threat = threading.Thread(target=dsmr_process, args=(), daemon=True)
-  dsmr_threat.start()
+  if (cfg['grid']['enable']):
+    dsmr_threat = threading.Thread(target=dsmr_process, args=(), daemon=True)
+    dsmr_threat.start()
 
-  evse_threat = threading.Thread(target=evse_process, args=(), daemon=True)
-  evse_threat.start()
+  if (cfg['evse']['enable']):
+    evse_threat = threading.Thread(target=evse_process, args=(), daemon=True)
+    evse_threat.start()
 
-  piko_threat = threading.Thread(target=piko_process, args=(), daemon=True)
-  piko_threat.start()
+  if (cfg['inverter']['enable']):
+    piko_threat = threading.Thread(target=piko_process, args=(), daemon=True)
+    piko_threat.start()
 
-  mqtt_threat = threading.Thread(target=mqtt_process, args=(), daemon=True)
-  mqtt_threat.start()
+  if (cfg['mqtt']['enable']):
+    mqtt_threat = threading.Thread(target=mqtt_process, args=(), daemon=True)
+    mqtt_threat.start()
 
-  pvo_threat = threading.Thread(target=pvo_process, args=(), daemon=True)
-  pvo_threat.start()
+  if (cfg['pvo']['enable']):
+    pvo_threat = threading.Thread(target=pvo_process, args=(), daemon=True)
+    pvo_threat.start()
 
   # Init data
   index: int = 0
@@ -946,7 +1020,8 @@ if __name__ == "__main__":
                      'P_Inj': int(piko.P_Inj),
                      'E_Inj': int(piko.E_Tot), 'E_Day': int(piko.E_Day),
                      'U1_DC': piko.U_DC[0], 'U2_DC': piko.U_DC[1],
-                     'I1_DC': piko.I_DC[0], 'I2_DC': piko.I_DC[1]}
+                     'I1_DC': piko.I_DC[0], 'I2_DC': piko.I_DC[1],
+                     'T_DC': piko.T_DC, 'T_AC': piko.T_AC}
           piko_df.loc[piko_index] = new_row
           piko_index = piko_index + 1
           if (len(piko_df) > 60): 
@@ -959,38 +1034,41 @@ if __name__ == "__main__":
     # check heartbeat from all threads
     sec = datetime.now().second
 
-    if (dsmr_hb > 60):
+    if ((dsmr_hb > 60) and (cfg['grid']['enable'])):
       if ((sec % 15)==0): logger.warning("DSMR - Communication lost")
     dsmr_hb = dsmr_hb + 1
 
-    if (evse_hb > 60):
+    if ((evse_hb > 60) and (cfg['evse']['enable'])):
       if ((sec % 15)==0):
         logger.warning("EVSE - Communication lost")
         #evse_threat.kill()
         #evse_threat.start()
     evse_hb = evse_hb + 1
 
-    if (piko_hb > 60):
-      if ((sec % 15)==0): logger.warning("PIKO - Communication lost")
+    if ((piko_hb > 60) and (cfg['inverter']['enable'])):
+      if ((sec % 15)==0): logger.warning("INVERTER - Communication lost")
     piko_hb = piko_hb + 1
 
     # Calculate mobile average for 5, 15 and 60 seconds of data
-    if ((sec % 5)==0):
-      dsmr_mean_5s = dsmr_df.iloc[-5:].mean(numeric_only=True).fillna(0)
-      evse_mean_5s = evse_df.iloc[-5:].mean(numeric_only=True).fillna(0)
-      piko_mean_5s = piko_df.iloc[-5:].mean(numeric_only=True).fillna(0)
-
     if ((sec % 15)==0):
       dsmr_mean_15s = dsmr_df.iloc[-15:].mean(numeric_only=True).fillna(0)
       evse_mean_15s = evse_df.iloc[-15:].mean(numeric_only=True).fillna(0)
       piko_mean_15s = piko_df.iloc[-15:].mean(numeric_only=True).fillna(0)
-      house_P = dsmr_mean_15s.P - evse_mean_15s.P_Delivered + piko_mean_15s.P_Inj
-      if (house_P < 0): house_P = 0
+
+    if ((sec % 5)==0):
+      dsmr_mean_5s = dsmr_df.iloc[-5:].mean(numeric_only=True).fillna(0)
+      evse_mean_5s = evse_df.iloc[-5:].mean(numeric_only=True).fillna(0)
+      piko_mean_5s = piko_df.iloc[-5:].mean(numeric_only=True).fillna(0)
+      if (index >= 15):
+         house_P = dsmr_mean_15s.P - evse_mean_15s.P_Delivered + piko_mean_15s.P_Inj
+         if (house_P < 0): house_P = 0
 
     if ((sec % 60)==0):
       dsmr_mean_60s = dsmr_df.iloc[-60:].mean(numeric_only=True).fillna(0)
       evse_mean_60s = evse_df.iloc[-60:].mean(numeric_only=True).fillna(0)
       piko_mean_60s = piko_df.iloc[-60:].mean(numeric_only=True).fillna(0)
+      piko_min_60s = piko_df.iloc[-60:].min(numeric_only=True).fillna(0)
+      piko_max_60s = piko_df.iloc[-60:].max(numeric_only=True).fillna(0)
 
 
     # Every 5 seconds (after at least 15 records in the dataframes)
@@ -1002,36 +1080,57 @@ if __name__ == "__main__":
                    dsmr_main.P_QH_Current, dsmr_main.P_QH_Last, dsmr_main.P_QH_MonthMax))
       logger.info("EVSE - P_Cons:%5i E_Cons:%10i I_Max:%3i Phases:%1i State:%s" %
                   (evse_mean_5s.P_Delivered, evse_main.E_Delivered, evse_main.I_Max_Applied, evse_main.Phases_Requested, evse_main.State))
-      logger.info("PIKO - Pwr:%5i E_Day:%5i E_Tot:%10i Status:%s" % (piko_mean_5s.P_Inj, piko_main.E_Day, piko_main.E_Tot, CnvStatusTxt(piko_main.Status)))
+      logger.info("PIKO - Pwr:%5i E_Day:%5i E_Tot:%10i Status:%s Temp:(DC:%.0f AC:%.0f)" %
+                   (piko_mean_5s.P_Inj, piko_main.E_Day, piko_main.E_Tot, CnvStatusTxt(piko_main.Status), piko_mean_5s.T_DC, piko_mean_5s.T_AC))
       logger.info("HOUSE- Pwr:%5i" % house_P)
 
       # - do loadbalancing algo to limit evse current if needed
+      #   TODO:Improove in 1Ph mode
       lb_index = lb_index + 1
       grid_maxphasecurrent = max([dsmr_mean_5s.I1, dsmr_mean_5s.I2, dsmr_mean_5s.I3])
       evse_current = max([evse_mean_5s.I1, evse_mean_5s.I2, evse_mean_5s.I3])
-      if (grid_maxphasecurrent > grid_maxcurrent):
-        grid_loadbalancing = evse_current - (grid_maxphasecurrent - grid_maxcurrent) - 1.5
-        if (grid_loadbalancing < 6): grid_loadbalancing = 0
-        ctrl.evse_loadbalancing_limit = grid_loadbalancing
-        lb_index = 0
-      else:
-        if (grid_loadbalancing < grid_maxcurrent):
-          if ((grid_loadbalancing >= 6) and (lb_index >= 3)):
-            if (grid_maxphasecurrent < grid_maxcurrent - 2.5):
-              grid_loadbalancing = grid_loadbalancing + 1
-              if (grid_maxphasecurrent < grid_maxcurrent - 4):
+      with ctrl_lock:
+        if (grid_maxphasecurrent > grid_maxcurrent):
+          grid_loadbalancing = evse_current - (grid_maxphasecurrent - grid_maxcurrent) - 1.5
+          if (grid_loadbalancing < 6): grid_loadbalancing = 0
+          ctrl.evse_loadbalancing_limit = grid_loadbalancing
+          lb_index = 0
+        else:
+          if (grid_loadbalancing < grid_maxcurrent):
+            if ((grid_loadbalancing >= 6) and (lb_index >= 3)):
+              if (grid_maxphasecurrent < grid_maxcurrent - 2.5):
                 grid_loadbalancing = grid_loadbalancing + 1
+                if (grid_maxphasecurrent < grid_maxcurrent - 4):
+                  grid_loadbalancing = grid_loadbalancing + 1
+                if (grid_maxphasecurrent < grid_maxcurrent - 8):
+                  grid_loadbalancing = grid_loadbalancing + 3
+                ctrl.evse_loadbalancing_limit = grid_loadbalancing
+                lb_index = 0
+            if ((grid_loadbalancing < 6) and (lb_index >= 4)):
               if (grid_maxphasecurrent < grid_maxcurrent - 8):
-                grid_loadbalancing = grid_loadbalancing + 3
-              ctrl.evse_loadbalancing_limit = grid_loadbalancing
-              lb_index = 0
-          if ((grid_loadbalancing < 6) and (lb_index >= 4)):
-            if (grid_maxphasecurrent < grid_maxcurrent - 8):
-               grid_loadbalancing = 6
-               ctrl.evse_loadbalancing_limit = grid_loadbalancing
-               lb_index = -3
+                grid_loadbalancing = 6
+                ctrl.evse_loadbalancing_limit = grid_loadbalancing
+                lb_index = -3
 
-         
+      # - Do Solar power algo
+      #if (((sec % 15)==0) and (index >= 60)):
+      if (((sec % 60)==0) and (index >= 60)):
+        mean_solar = piko_mean_60s.P_Inj
+        max_solar = piko_max_60s.P_Inj
+        min_solar = piko_min_60s.P_Inj
+        mean_evse = evse_mean_60s.P_Delivered
+        last_evse = evse_mean_15s.P_Delivered
+        mean_grid = dsmr_mean_60s.P
+        mean_house = mean_grid + mean_solar - mean_evse
+        margin_mean = mean_solar - mean_house
+        margin_max = (mean_solar - mean_house) + (max_solar - mean_solar)*0.9
+        margin_min = mean_solar - mean_house + (min_solar - mean_solar)*0.9
+        logger.info("SOLAR- Margin Min:%.0f Mean:%.0f Max:%.0f" % (margin_min, margin_mean, margin_max))
+        ctrl.evse_solar_margin_min = margin_min
+        ctrl.evse_solar_margin_mean = margin_mean
+        ctrl.evse_solar_margin_max = margin_max
+        ctrl.evse_solar_margin_updated = True
+
       # - send to MQTT for publishing
       with (mqtt_lock):
         mqtt.Meter_U = [dsmr_mean_5s.U1, dsmr_mean_5s.U2, dsmr_mean_5s.U3] 
@@ -1056,6 +1155,8 @@ if __name__ == "__main__":
         #mqtt.Inv_P_DC: list[float] = field(default_factory=list)
         #mqtt.Inv_Time_Run: int=0
         #mqtt.Inv_Time_Inst: int=0
+        mqtt.Inv_T_DC = piko_mean_5s.T_DC
+        mqtt.Inv_T_AC = piko_mean_5s.T_AC
         mqtt.Inv_Status = piko_main.Status
 
         mqtt.evse_U = [evse_mean_5s.U1, evse_mean_5s.U2, evse_mean_5s.U3]
