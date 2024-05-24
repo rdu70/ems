@@ -10,7 +10,7 @@
 #           Add solar tracking for EVSE
 #           Add Piko temperature control
 
-RELEASE = '2024.05.23'
+RELEASE = '2024.05.24'
 
 # general imports
 import sys
@@ -277,7 +277,6 @@ def evse_process():
     client.connect() # connect to device, reconnect automatically
     evse_connected = client.connected
 
-    #// Todo : Manage reconnect / %5(read All) + %1 (read I/P)
     while (evse_connected):
       evse_connected = client.connected
       # read floats
@@ -340,11 +339,8 @@ def evse_process():
 
                   amp_ratio = 230 * max(evse.Phases_Requested, 1)
                   ctrl.evse_solar_target = round(ctrl.evse_solar_margin_mean / amp_ratio)
-
-                  if (ctrl.evse_mode == EVSE_MODE_SOLAR_MIN): ctrl.evse_solar_target = ctrl.evse_solar_margin_min / amp_ratio
-                  if (ctrl.evse_mode == EVSE_MODE_SOLAR_MAX): ctrl.evse_solar_target = ctrl.evse_solar_margin_max / amp_ratio
-                  if (ctrl.evse_solar_target > 0) and (ctrl.evse_solar_target <= 3): ctrl.evse_solar_target = 0
-                  if (ctrl.evse_solar_target > 3) and (ctrl.evse_solar_target <= 3): ctrl.evse_solar_target = 0
+                  if (ctrl.evse_mode == EVSE_MODE_SOLAR_MIN): ctrl.evse_solar_target = round(ctrl.evse_solar_margin_min / amp_ratio)
+                  if (ctrl.evse_mode == EVSE_MODE_SOLAR_MAX): ctrl.evse_solar_target = round((ctrl.evse_solar_margin_max + (amp_ratio/3)) / amp_ratio)
 
                   if (evse.Phases_Requested == 3):
                     solar_I_start = cfg['evse']['solar_start_3ph']
@@ -634,7 +630,8 @@ def piko_process():
         LiveError = 0
         while (LiveError < 10):
 
-          if ((Count-1 % 5) == 0):   # every 5 sec shifted by 1 s
+          if ((Count % 5) == 0):   # every 5 sec
+            Status = -1; ErrorCode = 0;
             Snd=b'\x00\x57'
             Recv=SndRecv(Addr, Snd, Dbg)
             if ChkSum(Recv) != 0:
