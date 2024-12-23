@@ -1,0 +1,38 @@
+[mqtt]
+enable = true
+host = "192.168.1.10"
+port = 1883
+user = "ems"
+password = "ChangeMe"
+name = "ems"
+topic = "ems"
+
+[inverter]
+enable = true
+type = "huawei"
+host = "192.168.1.11"
+port = 502
+id = 1
+
+[evse]
+enable = true
+type = "alfen_modbus"
+host = "192.168.1.44"
+solar_start_1ph = 4
+solar_min_1ph = 7
+solar_max_1ph = 30
+solar_start_3ph = 2
+solar_min_3ph = 6
+solar_max_3ph = 9
+
+[grid]
+enable = true
+type = "p1"
+host = "192.168.1.45"
+port = 101
+maxcurrent = 32
+
+[pvo]
+enable = true
+apikey = "ChangeMe"
+systemid = 1234
